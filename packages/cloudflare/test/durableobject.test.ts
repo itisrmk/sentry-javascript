@@ -633,6 +633,69 @@ describe('instrumentDurableObjectWithSentry', () => {
       expect(frameworkDispatch.has(FrameworkLike.prototype.greet)).toBe(true);
       expect(second.greet('World')).toBe('Hello, World!');
     });
+
+    // Regression for https://github.com/getsentry/sentry-javascript/issues/25728
+    // The Agents SDK wraps `@callable()` methods on `this.constructor.prototype` during `super()`.
+    // When the subclass constructor then throws, that mutation is already on the prototype and the
+    // managed-method cache was never written. The next construction must still recognize the wrapper.
+    it('preserves a framework-managed callable when construction throws once and is retried', () => {
+      const callableWrappers = new WeakSet<object>();
+
+      class AgentLike {
+        constructor() {
+          const prototype = this.constructor.prototype as { read?: (this: AgentLike) => string };
+          const original = prototype.read;
+
+          if (typeof original !== 'function' || callableWrappers.has(original)) {
+            return;
+          }
+
+          const wrapped = function (this: AgentLike): string {
+            return original.call(this);
+          };
+          callableWrappers.add(wrapped);
+          prototype.read = wrapped;
+        }
+      }
+
+      let fail = true;
+
+      class RecoveryAgent extends AgentLike {
+        constructor() {
+          super();
+          if (fail) {
+            fail = false;
+            throw new Error('Exceeded allowed rows read in Durable Objects free tier.');
+          }
+        }
+
+        read(): string {
+          return 'ready';
+        }
+
+        fetchData(): string {
+          return 'data';
+        }
+      }
+
+      const originalFetchData = RecoveryAgent.prototype.fetchData;
+      const instrumented = instrumentDurableObjectWithSentry(vi.fn().mockReturnValue({}), RecoveryAgent as any);
+
+      expect(() => Reflect.construct(instrumented, [])).toThrow('Exceeded allowed rows read');
+
+      const recovered = Reflect.construct(instrumented, []) as RecoveryAgent;
+
+      expect(callableWrappers.has(RecoveryAgent.prototype.read)).toBe(true);
+      expect(recovered.read()).toBe('ready');
+
+      // A method the framework did not replace is still instrumented.
+      expect(RecoveryAgent.prototype.fetchData).not.toBe(originalFetchData);
+      expect(recovered.fetchData()).toBe('data');
+
+      // The successful construction caches the managed names and drops the pre-construction snapshot.
+      Reflect.construct(instrumented, []);
+      expect(callableWrappers.has(RecoveryAgent.prototype.read)).toBe(true);
+    });
   });
 
   // The wrapper replaces a method on a class the user owns, so it has to keep the parts of the

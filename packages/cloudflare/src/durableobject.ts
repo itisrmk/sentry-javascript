@@ -63,7 +63,18 @@ export function constructInstrumentedDurableObject<E, T extends DurableObject<E>
 
   const prototype = (newTarget as unknown as { prototype?: object }).prototype ?? target.prototype;
   const cachedFrameworkManagedMethods = frameworkManagedMethodsCache.get(prototype);
-  const methodsBeforeConstruction = cachedFrameworkManagedMethods ? undefined : resolvePrototypeMethods(prototype);
+  // Snapshot before `Reflect.construct` and keep it if construction throws. The Agents SDK
+  // replaces `@callable()` methods on the prototype during `super()`, and the managed-method
+  // cache is written only after construction returns. A retry in the same isolate must compare
+  // against that original snapshot, or those wrappers are treated as ordinary RPC methods and overwritten.
+  let methodsBeforeConstruction: Map<string, unknown> | undefined;
+  if (cachedFrameworkManagedMethods === undefined) {
+    methodsBeforeConstruction = initialPrototypeMethodsCache.get(prototype);
+    if (methodsBeforeConstruction === undefined) {
+      methodsBeforeConstruction = resolvePrototypeMethods(prototype);
+      initialPrototypeMethodsCache.set(prototype, methodsBeforeConstruction);
+    }
+  }
 
   // Pass `newTarget` so that subclasses of the instrumented class (e.g. the wrapper classes
   // created by wrangler's local dev tooling or `@cloudflare/vitest-pool-workers`) keep their
@@ -85,6 +96,9 @@ export function constructInstrumentedDurableObject<E, T extends DurableObject<E>
 }
 
 const frameworkManagedMethodsCache = new WeakMap<object, ReadonlySet<string>>();
+
+// Pre-construction method identity, kept only until a construction of that prototype succeeds.
+const initialPrototypeMethodsCache = new WeakMap<object, Map<string, unknown>>();
 
 /**
  * Collects the methods visible from a prototype, using normal property lookup precedence.
@@ -140,6 +154,7 @@ function resolveFrameworkManagedMethods(
   }
 
   frameworkManagedMethodsCache.set(prototype, managed);
+  initialPrototypeMethodsCache.delete(prototype);
 
   return managed;
 }
